@@ -4,4 +4,4 @@ peft==0.3.0
 omegaconf==2.3.0
 evaluate==0.4.0
 accelerate==0.20.3
-scikit-learn
+scikit-learn==1.2.2

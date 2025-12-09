@@ -5,7 +5,7 @@
 Triton GPU health check script (v2; Triton 3.x 対応)
 
 Usage:
-    python DNABERT_2_helper/triton_health_check_v2.py
+    python DNABERT_2_helper/triton_health_check.py
 """
 
 import sys
@@ -49,8 +49,7 @@ def main():
         print("[WARN] PyTorch is not installed; skip torch.cuda checks.")
         warnings.append(
             "PyTorch is not installed, so Triton will not be able to use "
-            "torch.cuda integration. Install torch with CUDA support "
-            "(e.g., torch==2.9.1+cu130)."
+            "torch.cuda integration. Install torch with CUDA support."
         )
     else:
         print("torch.__version__          :", torch.__version__)
@@ -68,52 +67,52 @@ def main():
             print("torch.cuda.is_available()  : True")
             print("torch.cuda.device_count()  :", device_count)
             print("torch.cuda.current_device():", current)
-            print("torch.cuda.get_device_name():",
-                  torch.cuda.get_device_name(current))
-
-    # --------------------------------------------------------
-    # 3. Triton runtime / device properties
-    # --------------------------------------------------------
-    print("\n[ Triton Runtime / Device Info ]")
-
-    # Triton 3.x では driver.get_device_count() は存在しないので、
-    # torch.cuda 情報を優先して使う。
-    if device_count == 0:
-        print("No CUDA devices reported by torch.cuda.")
-    else:
-        try:
-            # active driver / target 情報
-            target = driver.active.get_current_target()
-            print("Triton target backend      :", target.backend)
-            print("Triton target arch         :", target.arch)
-
-            # デバイスプロパティを Triton 経由で取得
-            props = driver.active.utils.get_device_properties(0)
-            # props は dict 形式のはず
-            print("device 0 name              :", props.get("name", "<unknown>"))
-            print("device 0 multiprocessors   :", props.get("multiprocessor_count"))
-            print("device 0 max_shared_mem    :", props.get("max_shared_mem"))
-            print("device 0 warpSize          :", props.get("warpSize"))
-        except Exception as e:
-            print("[WARN] Failed to query Triton driver properties:", e)
-            warnings.append(
-                f"Triton runtime could not query device properties: {e!r}"
+            print(
+                "torch.cuda.get_device_name():",
+                torch.cuda.get_device_name(current),
             )
 
     # --------------------------------------------------------
-    # 4. Minimal Triton kernel test
+    # 3. Triton runtime / device info
+    # --------------------------------------------------------
+    print("\n[ Triton Runtime / Device Info ]")
+    try:
+        # Triton 3.x のデフォルト backend や arch 情報を取得
+        target = triton.runtime.driver.active.get_current_target()
+        print("Triton target backend      :", target.backend)
+        print("Triton target arch         :", target.arch)
+
+        # デバイス情報 (単一 GPU 前提)
+        dev = triton.runtime.driver.active.get_device(0)
+        props = dev.props
+
+        print("device 0 name              :", getattr(props, "name", "<unknown>"))
+        print("device 0 multiprocessors   :", getattr(props, "multiprocessor_count", "<unknown>"))
+        print("device 0 max_shared_mem    :", getattr(props, "max_shared_mem", "<unknown>"))
+        print("device 0 warpSize          :", getattr(props, "warp_size", "<unknown>"))
+    except Exception as e:
+        print("[ERROR] Failed to query device info from Triton driver.")
+        print("        Details:", repr(e))
+        warnings.append(
+            "Triton runtime failed to query device information. "
+            "Check that the NVIDIA driver and CUDA are installed correctly."
+        )
+
+    # --------------------------------------------------------
+    # 4. Triton Kernel Test
     # --------------------------------------------------------
     print("\n[ Triton Kernel Test ]")
 
-    if not torch_cuda_ok or device_count == 0:
-        print("Triton kernel test skipped (no CUDA devices according to torch).")
+    if not torch_cuda_ok:
+        print("[INFO] Skip Triton kernel test because torch.cuda is not available.")
         warnings.append(
-            "Triton kernel test was skipped because torch.cuda "
-            "did not report any available CUDA devices."
+            "Skip Triton kernel test because torch.cuda.is_available() is False."
         )
     else:
         try:
-            # y = x + 1 のシンプルなカーネル
+            # ここでカーネルを普通に定義する
+            import triton.language as tl
+
             @triton.jit
             def add_one_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
                 pid = tl.program_id(axis=0)
@@ -124,37 +123,42 @@ def main():
                 y = x + 1
                 tl.store(y_ptr + offsets, y, mask=mask)
 
+            # テスト用のテンソル
             n_elements = 1024
             x = torch.arange(n_elements, dtype=torch.float32, device="cuda")
             y = torch.empty_like(x)
 
             BLOCK_SIZE = 256
-            grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+            grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
 
+            # Triton カーネルを起動
             add_one_kernel[grid](x, y, n_elements, BLOCK_SIZE=BLOCK_SIZE)
 
-            if torch.allclose(y, x + 1):
-                print("Triton kernel test: OK (y == x + 1)")
-            else:
-                print("Triton kernel test: FAILED (y != x + 1)")
-                warnings.append("Triton kernel ran but produced incorrect result.")
+            # 結果を検証
+            if not torch.allclose(y, x + 1):
+                raise RuntimeError("Triton kernel produced incorrect results.")
+
+            print("[OK] Triton JIT kernel ran successfully and produced correct results.")
         except Exception as e:
-            print("[ERROR] Triton kernel test failed:", e)
-            warnings.append(f"Triton JIT kernel failed to run: {e!r}")
+            print("[ERROR] Triton kernel test failed:", repr(e))
+            warnings.append(
+                "Triton JIT kernel failed to run: "
+                + repr(e)
+            )
 
     # --------------------------------------------------------
-    # 5. Summary
+    # 5. Warnings / summary
     # --------------------------------------------------------
     print("\n" + "=" * 60)
     print(" Warnings / Suggestions")
     print("=" * 60)
 
     if not warnings:
-        print("No critical issues detected in Triton checks. 🎉")
+        print("No major problems detected. Triton seems to be working correctly.")
     else:
         for i, w in enumerate(warnings, 1):
             print(f"\n[WARN {i}]")
-            print(textwrap.dedent(w).strip())
+            print(textwrap.fill(w, width=70))
 
     print("\nTriton health check completed.")
 
