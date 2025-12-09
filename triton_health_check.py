@@ -10,24 +10,30 @@ Usage:
 
 import textwrap
 
+# Triton / tl をグローバルに import しておく（ここが重要）
+try:
+    import triton
+    import triton.language as tl
+    from triton.runtime import driver
+except ImportError:
+    triton = None
+    tl = None
+    driver = None
+
 
 def main():
     print("=" * 60)
-    print(" Triton GPU Health Check (v2 for Triton 3.x, stable)")
+    print(" Triton GPU Health Check (v2 for Triton 3.x, global-import)")
     print("=" * 60)
 
     warnings = []
 
     # --------------------------------------------------------
-    # 1. Import Triton
+    # 1. Triton import チェック
     # --------------------------------------------------------
-    try:
-        import triton
-        import triton.language as tl
-    except ImportError as e:
+    if triton is None or tl is None:
         print("[ERROR] Failed to import Triton.")
         print("        Please install Triton (e.g., `pip install triton`).")
-        print("        Details:", e)
         return
 
     print("\n[ Triton Info ]")
@@ -69,26 +75,24 @@ def main():
                   torch.cuda.get_device_name(current))
 
     # --------------------------------------------------------
-    # 3. Triton runtime / target info (最低限だけ)
+    # 3. Triton runtime / target info（最低限）
     # --------------------------------------------------------
     print("\n[ Triton Runtime / Device Info ]")
-    try:
-        from triton.runtime import driver
-
-        # Triton 3.x では active driver から target を取得
-        target = driver.active.get_current_target()
-        print("Triton target backend      :", target.backend)
-        print("Triton target arch         :", target.arch)
-
-        # ここでは Triton の device props 取得は行わず、
-        # 詳細なハード情報は PyTorch 側に任せる
-    except Exception as e:
-        print("[WARN] Failed to query target info from Triton driver.")
-        print("       Details:", repr(e))
-        warnings.append(
-            "Triton runtime failed to query target information. "
-            "If PyTorch CUDA is working, Triton may still be usable."
-        )
+    if driver is not None:
+        try:
+            target = driver.active.get_current_target()
+            print("Triton target backend      :", target.backend)
+            print("Triton target arch         :", target.arch)
+        except Exception as e:
+            print("[WARN] Failed to query target info from Triton driver.")
+            print("       Details:", repr(e))
+            warnings.append(
+                "Triton runtime failed to query target information. "
+                "If PyTorch CUDA is working, Triton may still be usable."
+            )
+    else:
+        print("[WARN] Triton driver not available.")
+        warnings.append("Triton driver module is not available.")
 
     # --------------------------------------------------------
     # 4. Triton Kernel Test
@@ -102,7 +106,7 @@ def main():
         )
     else:
         try:
-            # Triton カーネルを通常の Python 関数として定義
+            # ここで使う tl はモジュールグローバル
             @triton.jit
             def add_one_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
                 pid = tl.program_id(axis=0)
@@ -113,7 +117,6 @@ def main():
                 y = x + 1
                 tl.store(y_ptr + offsets, y, mask=mask)
 
-            # テスト用テンソル
             n_elements = 1024
             x = torch.arange(n_elements, dtype=torch.float32, device="cuda")
             y = torch.empty_like(x)
@@ -121,10 +124,8 @@ def main():
             BLOCK_SIZE = 256
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
 
-            # Triton カーネルを起動
             add_one_kernel[grid](x, y, n_elements, BLOCK_SIZE=BLOCK_SIZE)
 
-            # 結果チェック
             if not torch.allclose(y, x + 1):
                 raise RuntimeError("Triton kernel produced incorrect results.")
 
