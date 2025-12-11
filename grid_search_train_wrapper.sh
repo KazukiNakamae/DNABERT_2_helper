@@ -2,9 +2,10 @@
 set -eu
 
 ###############################################
-# 汎用グリッドサーチラッパー for train.py (1GPU / 多GPU 対応版)
+# Generic grid search wrapper for train.py (1GPU / multi-GPU)
 #
-# 使い方例 (1GPU):
+# Example (1 GPU, subset dataset):
+#
 #   ./grid_search_train_wrapper.sh \
 #     --train_script /path/to/train.py \
 #     --data_path    /path/to/dataset_subset20 \
@@ -12,20 +13,25 @@ set -eu
 #     --output_root  /path/to/output_grid_subset20 \
 #     --run_name_prefix DNABERT2_fd1_subset20 \
 #     --nproc_per_node 1 \
+#     --lrs "1e-5,2e-5,3e-5" \
+#     --weight_decays "0.01,0.03" \
 #     --extra_args "--kmer -1 --model_max_length 10 --fp16 --find_unused_parameters False"
 #
-# 使い方例 (4GPU):
+# Example (4 GPUs, same grid):
+#
 #   ./grid_search_train_wrapper.sh \
 #     --train_script /path/to/train.py \
 #     --data_path    /path/to/dataset_subset20 \
 #     --model_name_or_path zhihan1996/DNABERT-2-117M \
-#     --output_root  /path/to/output_grid_subset20 \
+#     --output_root  /path/to/output_grid_subset20_4gpu \
 #     --run_name_prefix DNABERT2_fd1_subset20_4gpu \
 #     --nproc_per_node 4 \
+#     --lrs "1e-5,2e-5,3e-5" \
+#     --weight_decays "0.01,0.03" \
 #     --extra_args "--kmer -1 --model_max_length 10 --fp16 --find_unused_parameters False"
 ###############################################
 
-# ========= デフォルト値 =========
+# ========= Default values =========
 NPROC_PER_NODE=1
 RUN_NAME_PREFIX="gridrun"
 OUTPUT_ROOT="./output"
@@ -33,10 +39,23 @@ DATA_PATH=""
 MODEL_NAME_OR_PATH=""
 TRAIN_SCRIPT="train.py"
 LOG_ROOT="./grid_logs"
-
 EXTRA_ARGS=""
 
-# ========= 引数パース =========
+# Defaults for grid (can be overridden via CLI)
+BATCH_CONFIGS_DEFAULT="64x2,128x2"  # "<per_device_bs>x<grad_accum>" (global eff_batch = bs * accum * WORLD_SIZE)
+LRS_DEFAULT="1e-5,2e-5,3e-5"
+EPOCHS_DEFAULT="2"
+WARMUP_RATIOS_DEFAULT="0.1"
+WEIGHT_DECAYS_DEFAULT="0.01,0.03"
+
+# Placeholders for CLI overrides (comma-separated strings)
+BATCH_CONFIGS_STR=""
+LRS_STR=""
+EPOCHS_STR=""
+WARMUP_RATIOS_STR=""
+WEIGHT_DECAYS_STR=""
+
+# ========= Parse arguments =========
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --train_script)
@@ -71,9 +90,34 @@ while [[ $# -gt 0 ]]; do
       EXTRA_ARGS="$2"
       shift 2
       ;;
+    --batch_configs)
+      # e.g. --batch_configs "64x2,128x2,128x4"
+      BATCH_CONFIGS_STR="$2"
+      shift 2
+      ;;
+    --lrs)
+      # e.g. --lrs "1e-5,2e-5,3e-5"
+      LRS_STR="$2"
+      shift 2
+      ;;
+    --epochs)
+      # e.g. --epochs "2,4"
+      EPOCHS_STR="$2"
+      shift 2
+      ;;
+    --warmup_ratios)
+      # e.g. --warmup_ratios "0.1,0.05"
+      WARMUP_RATIOS_STR="$2"
+      shift 2
+      ;;
+    --weight_decays)
+      # e.g. --weight_decays "0.01,0.03"
+      WEIGHT_DECAYS_STR="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown argument: $1"
-      echo "  (ヒント: train.py に渡したい引数は --extra_args \"...\" の中に書いてください)"
+      echo "  (Hint: arguments for train.py should go inside --extra_args \"...\" )"
       exit 1
       ;;
   esac
@@ -93,52 +137,60 @@ mkdir -p "${LOG_ROOT}"
 
 WORLD_SIZE=${NPROC_PER_NODE}
 
-# ========= train.csv 行数から TOTAL_TRAIN_EXAMPLES を算出 =========
+# ========= Build arrays from defaults or CLI overrides =========
+
+# batch configs
+if [[ -n "${BATCH_CONFIGS_STR}" ]]; then
+  IFS=',' read -r -a BATCH_CONFIGS <<< "${BATCH_CONFIGS_STR}"
+else
+  IFS=',' read -r -a BATCH_CONFIGS <<< "${BATCH_CONFIGS_DEFAULT}"
+fi
+
+# learning rates
+if [[ -n "${LRS_STR}" ]]; then
+  IFS=',' read -r -a LRS <<< "${LRS_STR}"
+else
+  IFS=',' read -r -a LRS <<< "${LRS_DEFAULT}"
+fi
+
+# epochs
+if [[ -n "${EPOCHS_STR}" ]]; then
+  IFS=',' read -r -a EPOCHS <<< "${EPOCHS_STR}"
+else
+  IFS=',' read -r -a EPOCHS <<< "${EPOCHS_DEFAULT}"
+fi
+
+# warmup ratios
+if [[ -n "${WARMUP_RATIOS_STR}" ]]; then
+  IFS=',' read -r -a WARMUP_RATIOS <<< "${WARMUP_RATIOS_STR}"
+else
+  IFS=',' read -r -a WARMUP_RATIOS <<< "${WARMUP_RATIOS_DEFAULT}"
+fi
+
+# weight decays
+if [[ -n "${WEIGHT_DECAYS_STR}" ]]; then
+  IFS=',' read -r -a WEIGHT_DECAYS <<< "${WEIGHT_DECAYS_STR}"
+else
+  IFS=',' read -r -a WEIGHT_DECAYS <<< "${WEIGHT_DECAYS_DEFAULT}"
+fi
+
+# ========= Detect train size from train.csv =========
 if [[ -f "${DATA_PATH}/train.csv" ]]; then
   echo "Detecting train size from ${DATA_PATH}/train.csv ..."
   TOTAL_TRAIN_EXAMPLES=$(python - <<EOF
 import pandas as pd
 from pathlib import Path
-
 df = pd.read_csv(Path("${DATA_PATH}") / "train.csv")
 print(len(df))
 EOF
 )
 else
-  echo "ERROR: ${DATA_PATH}/train.csv not found. This wrapper assumes CSV (train/dev/test.csv) dataset."
+  echo "ERROR: ${DATA_PATH}/train.csv not found. This wrapper assumes CSV dataset (train/dev/test.csv)."
   exit 1
 fi
 
 echo "TOTAL_TRAIN_EXAMPLES: ${TOTAL_TRAIN_EXAMPLES}"
 echo "WORLD_SIZE (GPUs per node): ${WORLD_SIZE}"
-
-# ========= グリッド候補 =========
-# BATCH_CONFIGS: "<per_device_train_batch_size>x<gradient_accumulation_steps>"
-# 有効バッチサイズ eff_batch = BS * GAS * WORLD_SIZE
-BATCH_CONFIGS=(
-  "8x8"    # eff_batch=64 x WORLD_SIZE
-  "16x8"    # eff_batch=128 x WORLD_SIZE
-  "32x8"   # eff_batch=256 x WORLD_SIZE
-)
-
-LRS=(
-  "1e-5"
-  "2e-5"
-  "3e-5"
-)
-
-EPOCHS=(
-  "2"
-)
-
-WARMUP_RATIOS=(
-  "0.1"
-)
-
-WEIGHT_DECAYS=(
-  "0.01"
-  "0.03"
-)
 
 echo "Grid search settings:"
 echo "  BATCH_CONFIGS  : ${BATCH_CONFIGS[*]}"
@@ -149,13 +201,13 @@ echo "  WEIGHT_DECAYS  : ${WEIGHT_DECAYS[*]}"
 echo "  NPROC_PER_NODE : ${NPROC_PER_NODE}"
 echo "  EXTRA_ARGS     : ${EXTRA_ARGS}"
 
-# ========= ループ開始 =========
+# ========= Main grid loop =========
 for cfg in "${BATCH_CONFIGS[@]}"; do
   IFS="x" read -r BS GAS <<< "${cfg}"
 
   eff_batch=$(( BS * GAS * WORLD_SIZE ))
 
-  # 1 epoch あたりのステップ数（global eff_batch 基準）
+  # steps per epoch based on global effective batch size
   steps_per_epoch=$(( (TOTAL_TRAIN_EXAMPLES + eff_batch - 1) / eff_batch ))
 
   for lr in "${LRS[@]}"; do
@@ -163,7 +215,7 @@ for cfg in "${BATCH_CONFIGS[@]}"; do
       total_steps=$(( steps_per_epoch * epochs ))
 
       for warmup_ratio in "${WARMUP_RATIOS[@]}"; do
-        # warmup_steps = total_steps * warmup_ratio
+        # compute warmup steps = total_steps * warmup_ratio
         warmup_steps=$(python - <<EOF
 total_steps = ${total_steps}
 warmup_ratio = ${warmup_ratio}
