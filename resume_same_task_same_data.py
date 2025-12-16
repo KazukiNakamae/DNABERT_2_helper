@@ -116,6 +116,7 @@ def main():
     #    NOTE: For strict resume, keep settings consistent with the original run.
     #    This script keeps them simple; if you need exact matching, pass the same values as before.
     training_args = transformers.TrainingArguments(
+        optim="adamw_torch",
         output_dir=outdir,
         evaluation_strategy="steps",
         eval_steps=args.eval_steps,
