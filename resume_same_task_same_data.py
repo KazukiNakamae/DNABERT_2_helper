@@ -4,6 +4,7 @@
 import os
 import csv
 import json
+import pathlib
 import argparse
 import logging
 from dataclasses import dataclass, field
@@ -96,6 +97,13 @@ def main():
     ckpt = os.path.abspath(args.checkpoint_dir)
     parent = os.path.dirname(ckpt)
     outdir = os.path.abspath(args.output_dir) if args.output_dir else parent
+
+    p = pathlib.Path(os.path.join(ckpt,"trainer_state.json"))
+    st = json.loads(p.read_text())
+    st["best_model_checkpoint"] = None
+    st["best_metric"] = None
+    p.write_text(json.dumps(st, indent=2))
+    print("patched:", p)
 
     # 1) Load tokenizer/model from checkpoint (most reliable for head/labels consistency)
     tokenizer = transformers.AutoTokenizer.from_pretrained(ckpt, use_fast=True, trust_remote_code=True)
