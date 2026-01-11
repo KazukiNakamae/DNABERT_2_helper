@@ -608,8 +608,8 @@ def main():
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True)
-    model = AutoModelForSequenceClassification.from_pretrained(args.model_dir, local_files_only=True).to(device).eval()
+    tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True, trust_remote_code=True)
+    model = AutoModelForSequenceClassification.from_pretrained(args.model_dir, local_files_only=True, trust_remote_code=True).to(device).eval()
 
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     valid = {"logit", "prob", "logprob", "margin", "loss"}
